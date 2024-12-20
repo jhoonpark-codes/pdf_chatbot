@@ -21,8 +21,7 @@ import hashlib
 import time
 warnings.filterwarnings("ignore")
 
-# Load environment variables
-# load_dotenv('.env', override=True)
+
 
 # Azure OpenAI 설정
 AZURE_OPENAI_API_KEY = "put_yours"
