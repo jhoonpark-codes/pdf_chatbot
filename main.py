@@ -19,22 +19,30 @@ import concurrent.futures
 import shutil
 import hashlib
 import time
+import pytesseract
+from pdf2image import convert_from_bytes
+import fitz  # PyMuPDF
 warnings.filterwarnings("ignore")
 
-
+# Load environment variables
+load_dotenv('.env', override=True)
 
 # Azure OpenAI 설정
-AZURE_OPENAI_API_KEY = "put_yours"
-AZURE_OPENAI_ENDPOINT = "put_yours"
-AZURE_DEPLOYMENT_NAME = "put_yours"
-AZURE_OPENAI_API_VERSION = "put_yours"
+AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
+AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
+AZURE_DEPLOYMENT_NAME = os.getenv("AZURE_DEPLOYMENT_NAME")
+AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION")
 
 # Azure OpenAI Embedding 설정
-AZURE_OPENAI_EMBEDDING_DEPLOYMENT_NAME = "put_yours"
-AZURE_OPENAI_EMBEDDING_MODEL = "put_yours"
-AZURE_OPENAI_EMBEDDING_API_KEY = "put_yours"
-AZURE_OPENAI_EMBEDDING_ENDPOINT = "put_yours"
-AZURE_OPENAI_EMBEDDING_API_VERSION = "put_yours"
+AZURE_OPENAI_EMBEDDING_DEPLOYMENT_NAME = os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT_NAME")
+AZURE_OPENAI_EMBEDDING_MODEL = os.getenv("AZURE_OPENAI_EMBEDDING_MODEL")
+AZURE_OPENAI_EMBEDDING_API_KEY = os.getenv("AZURE_OPENAI_EMBEDDING_API_KEY")
+AZURE_OPENAI_EMBEDDING_ENDPOINT = os.getenv("AZURE_OPENAI_EMBEDDING_ENDPOINT")
+AZURE_OPENAI_EMBEDDING_API_VERSION = os.getenv("AZURE_OPENAI_EMBEDDING_API_VERSION")
+
+# Azure Computer Vision 설정 추가
+AZURE_VISION_KEY = os.getenv("AZURE_VISION_KEY")
+AZURE_VISION_ENDPOINT = os.getenv("AZURE_VISION_ENDPOINT")
 
 # Streamlit 페이지 설정
 st.set_page_config(page_title="PDF 챗봇", layout="wide")
@@ -63,7 +71,7 @@ if not os.path.exists(VECTOR_STORE_DIR):
     os.makedirs(VECTOR_STORE_DIR)
 
 def encode_image_to_base64(image_bytes: bytes) -> str:
-    """이미지를 base64로 인코딩"""
+    """미지를 base64로 인코딩"""
     return base64.b64encode(image_bytes).decode('utf-8')
 
 def optimize_image(image_data: bytes, max_size: int = 400) -> bytes:
@@ -118,49 +126,141 @@ def process_images(reader):
         contents.append(("", images))
     return contents, get_time()
 
+def extract_text_from_image(image):
+    """이미지에서 텍스트 추출 (OCR)"""
+    try:
+        text = pytesseract.image_to_string(image, lang='kor+eng')  # 한글+영어 지원
+        return text.strip()
+    except Exception as e:
+        st.warning(f"OCR 처리 중 오류: {str(e)}")
+        return ""
+
+def extract_text_with_azure_vision(image_bytes: bytes) -> str:
+    """Azure Computer Vision을 사용하여 이미지에서 텍스트 추출"""
+    try:
+        # Computer Vision 클라이언트 생성
+        from azure.cognitiveservices.vision.computervision import ComputerVisionClient
+        from msrest.authentication import CognitiveServicesCredentials
+        
+        computervision_client = ComputerVisionClient(
+            AZURE_VISION_ENDPOINT,
+            CognitiveServicesCredentials(AZURE_VISION_KEY)
+        )
+        
+        # 이미지에서 텍스트 추출
+        response = computervision_client.read_in_stream(image_bytes, raw=True)
+        operation_location = response.headers["Operation-Location"]
+        operation_id = operation_location.split("/")[-1]
+        
+        # 결과 대기
+        import time
+        while True:
+            result = computervision_client.get_read_result(operation_id)
+            if result.status not in ['notStarted', 'running']:
+                break
+            time.sleep(1)
+        
+        # 텍스트 추출
+        text = []
+        if result.status == "succeeded":
+            for text_result in result.analyze_result.read_results:
+                for line in text_result.lines:
+                    text.append(line.text)
+        
+        return "\n".join(text)
+        
+    except Exception as e:
+        st.warning(f"Azure Vision OCR 처리 중 오류: {str(e)}")
+        return ""
+
 def process_pdf(uploaded_file, process_images=False):
-    """PDF 처리 with 시간 측정"""
+    """PDF 처리 - 이미지 처리 옵션 적용"""
     try:
         start_total_time = time.time()
         pdf_bytes = uploaded_file.read()
-        reader = PdfReader(io.BytesIO(pdf_bytes))
         contents = []
         
         with st.spinner('PDF 처리 중...'):
-            # 텍스트 처리 시간 측정
+            # PDF 로드
+            pdf_document = fitz.open(stream=pdf_bytes, filetype="pdf")
+            total_pages = len(pdf_document)
+            st.info(f"총 {total_pages}페이지를 처리합니다.")
+            
             text_start_time = time.time()
-            for page in reader.pages:
-                text = page.extract_text()
-                contents.append((text, []))
+            has_content = False
+            
+            progress_container = st.empty()
+            
+            for page_num in range(total_pages):
+                page = pdf_document[page_num]
+                text = page.get_text().strip()
+                images = []
+                
+                # 페스트가 있는 경우
+                if text:
+                    has_content = True
+                    progress_container.info(f"페이지 {page_num + 1}: {len(text)} 글자 발견")
+                
+                # 이미지 처리 옵션이 켜져 있을 때만 이미지 처리
+                if process_images:
+                    # 페이지를 이미지로 변환
+                    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+                    img_data = pix.tobytes("jpeg")
+                    
+                    # 이미지 최적화
+                    try:
+                        img = Image.open(io.BytesIO(img_data))
+                        img_byte_arr = io.BytesIO()
+                        img.save(img_byte_arr, format='JPEG', quality=85, optimize=True)
+                        img_data = img_byte_arr.getvalue()
+                        img_data = optimize_image(img_data, max_size=1200)
+                        
+                        img_base64 = encode_image_to_base64(img_data)
+                        images.append(img_base64)
+                        has_content = True
+                        progress_container.info(f"페이지 {page_num + 1}: 이미지 추출 완료")
+                    except Exception as e:
+                        st.warning(f"페이지 {page_num + 1} 이미지 처리 중 오류: {str(e)}")
+                
+                contents.append((text, images))
+                
+                # 진행률 표시
+                progress_text = f"페이지 {page_num + 1}/{total_pages} 처리 중..."
+                st.progress((page_num + 1) / total_pages, text=progress_text)
+            
+            pdf_document.close()
             text_time = time.time() - text_start_time
             
-            # 이미지 처리 시간 측정
-            image_time = 0
-            if process_images:
-                image_start_time = time.time()
-                for page_num, page in enumerate(reader.pages):
-                    if '/Resources' in page and '/XObject' in page['/Resources']:
-                        xObject = page['/Resources']['/XObject'].get_object()
-                        images = process_images_parallel(page, xObject)
-                        if images:
-                            contents[page_num] = (contents[page_num][0], images)
-                image_time = time.time() - image_start_time
+            if not has_content:
+                st.error("PDF에서 내용을 추출할 수 없습니다.")
+                return None
             
             total_time = time.time() - start_total_time
             
             # 처리 시간 정보를 세션 상태에 저장
             st.session_state.processing_times = {
                 "text": round(text_time, 2),
-                "image": round(image_time, 2),
+                "image": 0,
                 "total": round(total_time, 2)
             }
             
-            # 처리 시간 표시
-            st.success(f"PDF 업로드 완료 (텍스트: {text_time:.2f}초, 이미지: {image_time:.2f}초)")
+            # 처리 결과 요약
+            summary = f"""
+            PDF 처리 완료:
+            - 총 {total_pages}페이지
+            - 처리 시간: {total_time:.2f}초
+            """
+            if process_images:
+                summary += f"\n- 이미지 추출: {total_pages}장"
+            
+            st.success(summary)
+            
             return contents
             
     except Exception as e:
+        import traceback
         st.error(f"PDF 처리 중 오류 발생: {str(e)}")
+        st.error(f"상세 오류 정보:\n```\n{traceback.format_exc()}\n```")
         return None
 
 def analyze_image_content(image_base64: str) -> str:
@@ -174,7 +274,7 @@ def analyze_image_content(image_base64: str) -> str:
                     "content": [
                         {
                             "type": "text",
-                            "text": "이 이미지에서 무엇을 볼 수 있는지 자세히 설명해주세요."
+                            "text": "이 이미지에 무엇을 볼 수 있는지 자세히 설명해주세요."
                         },
                         {
                             "type": "image_url",
@@ -193,98 +293,89 @@ def analyze_image_content(image_base64: str) -> str:
         return ""
 
 def create_vector_store(contents):
+    """벡터 저장소 생성 - 이미지 처리 옵션 적용"""
     try:
         documents = []
-        with st.spinner('문서 텍스트 / 이미지 처리 중...'):
+        with st.spinner('문서 처리 중...'):
             start_total_time = time.time()
+            image_start_time = time.time()
+            has_content = False
             
-            # 텍스트 벡터화 시간 측정
-            text_start_time = time.time()
-            
-            # 텍스트 분할 및 벡터화
-            splitter = RecursiveCharacterTextSplitter(
-                chunk_size=500,
-                chunk_overlap=50,
-                length_function=len,
-                separators=["\n\n", "\n", " ", ""]
-            )
-            
-            # 텍스트 처리를 배치로 수행
             progress_bar = st.progress(0)
             total_items = len(contents)
             
             for idx, (text, images) in enumerate(contents):
-                if text.strip():
-                    chunks = splitter.split_text(text)
-                    for chunk_num, chunk in enumerate(chunks):
+                try:
+                    page_content = ""
+                    
+                    # 텍스트가 있는 경우 처리
+                    if text and text.strip():
+                        page_content = text.strip()
+                        has_content = True
+                    
+                    # 이미지가 있는 경우에만 이미지 분석 수행
+                    if images:
+                        image_descriptions = []
+                        for img_idx, image_base64 in enumerate(images):
+                            description = analyze_image_content(image_base64)
+                            if description:
+                                image_descriptions.append(f"Image {img_idx + 1}: {description}")
+                                has_content = True
+                        
+                        if image_descriptions:
+                            page_content += "\n\n" if page_content else ""
+                            page_content += "Image Descriptions:\n" + "\n".join(image_descriptions)
+                    
+                    # 페이지에 내용이 있는 경우만 문서 추가
+                    if page_content:
                         metadata = {
                             "page": idx,
-                            "chunk": chunk_num,
                             "images": images if images else []
                         }
-                        documents.append(Document(page_content=chunk, metadata=metadata))
+                        documents.append(Document(page_content=page_content, metadata=metadata))
+                
+                except Exception as e:
+                    st.warning(f"페이지 {idx + 1} 처리 중 오류: {str(e)}")
+                
                 progress_bar.progress((idx + 1) / total_items)
             
-            text_time = time.time() - text_start_time
-            
-            # 이미지 분석 시간 측정
-            image_start_time = time.time()
-            
-            # 이미지가 있는 문서들만 처리
-            docs_with_images = [(i, doc) for i, doc in enumerate(documents) if doc.metadata.get("images")]
-            if docs_with_images:
-                with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
-                    # 이미지 분석 작업 제출
-                    futures = {
-                        executor.submit(
-                            analyze_image_content, 
-                            image_base64
-                        ): (doc_idx, img_idx, image_base64)
-                        for doc_idx, doc in docs_with_images
-                        for img_idx, image_base64 in enumerate(doc.metadata["images"])
-                    }
-                    
-                    # 결과 수집
-                    for future in concurrent.futures.as_completed(futures):
-                        doc_idx, img_idx, _ = futures[future]
-                        try:
-                            description = future.result()
-                            if description:
-                                current_content = documents[doc_idx].page_content
-                                documents[doc_idx].page_content = f"{current_content}\n\nImage {img_idx + 1} Description:\n{description}"
-                        except Exception as e:
-                            st.warning(f"이미지 분석 중 오류 발생: {str(e)}")
+            if not has_content:
+                st.error("처리할 수 있는 내용이 없습니다.")
+                return None
             
             image_time = time.time() - image_start_time
             
             # 임베딩 생성
-            embeddings = AzureOpenAIEmbeddings(
-                deployment=AZURE_OPENAI_EMBEDDING_DEPLOYMENT_NAME,
-                model=AZURE_OPENAI_EMBEDDING_MODEL,
-                api_key=AZURE_OPENAI_EMBEDDING_API_KEY,
-                azure_endpoint=AZURE_OPENAI_EMBEDDING_ENDPOINT,
-                api_version=AZURE_OPENAI_API_VERSION,
-            )
-            
-            # 벡터 저장소 생성 (배치 처리)
-            texts = [doc.page_content for doc in documents]
-            metadatas = [doc.metadata for doc in documents]
-            vector_store = FAISS.from_texts(texts=texts, embedding=embeddings, metadatas=metadatas)
-            
-            total_time = time.time() - start_total_time
-            
-            # 처리 시간 저장
-            st.session_state.processing_times = {
-                "text": round(text_time, 2),
-                "image": round(image_time, 2),
-                "total": round(total_time, 2)
-            }
-            
-            st.success("벡터 저장소 생성 완료")
-            return vector_store
+            try:
+                embeddings = AzureOpenAIEmbeddings(
+                    deployment=AZURE_OPENAI_EMBEDDING_DEPLOYMENT_NAME,
+                    model=AZURE_OPENAI_EMBEDDING_MODEL,
+                    api_key=AZURE_OPENAI_EMBEDDING_API_KEY,
+                    azure_endpoint=AZURE_OPENAI_EMBEDDING_ENDPOINT,
+                    api_version=AZURE_OPENAI_API_VERSION,
+                )
+                
+                vector_store = FAISS.from_documents(documents, embeddings)
+                
+                total_time = time.time() - start_total_time
+                
+                # 처리 시간 업데이트
+                if "processing_times" in st.session_state:
+                    times = st.session_state.processing_times
+                    st.session_state.processing_times.update({
+                        "image": round(image_time, 2) if any(doc.metadata.get("images") for doc in documents) else 0,
+                        "total": round(times["total"] + total_time, 2)
+                    })
+                
+                st.success("벡터 저장소 생성 완료")
+                return vector_store
+                
+            except Exception as e:
+                st.error(f"벡터 저장소 생성 중 오류: {str(e)}")
+                return None
             
     except Exception as e:
-        st.error(f"벡터 저장소 생성 중 오류 발생: {str(e)}")
+        st.error(f"문서 처리 중 오류 발생: {str(e)}")
         return None
 
 def initialize_conversation(vector_store):
@@ -356,7 +447,7 @@ def process_single_image(image):
                 size = (image['/Width'], image['/Height'])
                 img_data = Image.frombytes('RGB', size, image._data)
                 img_byte_arr = io.BytesIO()
-                img_data.save(img_byte_arr, format='JPEG', quality=60)  # 품질 낮춤
+                img_data.save(img_byte_arr, format='JPEG', quality=60)  # 품질 낮
                 img_data = img_byte_arr.getvalue()
             
             # 이미지 크기 제한
@@ -367,7 +458,7 @@ def process_single_image(image):
         return None
 
 def analyze_images_batch(images, batch_size=4):
-    """이미지 배치 분석"""
+    """이미지 배치 분"""
     descriptions = []
     for i in range(0, len(images), batch_size):
         batch = images[i:i + batch_size]
@@ -415,14 +506,14 @@ def analyze_and_cache_image(image_base64, image_key, file_hash):
 
 @st.cache_data(show_spinner=False)
 def get_file_hash(file_content: bytes) -> str:
-    """파일 용의 해시값 생성"""
+    """파일 용 해시값 생성"""
     return hashlib.md5(file_content).hexdigest()
 
 # 그 다음 캐시 관리 함수 정의
 def clear_cache_for_file(file_name: str):
     """특정 파일에 대한 캐시 초기화"""
     try:
-        # 이미지 처리 캐시 초기화
+        # 이미��� 처리 캐시 초기화
         process_and_cache_image.clear()
         # 이미지 분석 캐시 초기화
         analyze_and_cache_image.clear()
@@ -436,7 +527,7 @@ if "current_file_hash" not in st.session_state:
     st.session_state.current_file_hash = None
 
 def get_memory_usage():
-    """시스템 메모리 사용량 조회"""
+    """시스템 메모리 사용량 조"""
     import psutil
     process = psutil.Process()
     
@@ -502,7 +593,7 @@ with st.sidebar:
     # PDF 소스 선택
     pdf_source = st.radio(
         "PDF 소스 선택",
-        ["기본 문서 (YOUR_DEFAULT.pdf)", "파일 업로드"]
+        ["기본 문서 (china_music.pdf)", "파일 업로드"]
     )
     
     if pdf_source == "파일 업로드":
@@ -519,7 +610,7 @@ with st.sidebar:
                 st.session_state.current_file_hash = file_hash
     else:
         # 기본 PDF 파일 경로 확인
-        default_pdf_path = "./YOUR_DEFAULT.pdf"
+        default_pdf_path = "./china_music.pdf"
         if not os.path.exists(default_pdf_path):
             st.error("기본 PDF 파일을 찾을 수 없습니다.")
             uploaded_file = None
@@ -545,11 +636,11 @@ with st.sidebar:
             if pdf_source == "파일 업로드":
                 store_name = uploaded_file.name.replace('.pdf', '')
             else:
-                store_name = "YOUR_DEFAULT"
+                store_name = "china_music"
             
             vector_store = None
             if save_vector:
-                # 기존 벡터 저장소 확인
+                # 기 벡터 저장소 확인
                 embeddings = AzureOpenAIEmbeddings(
                     deployment=AZURE_OPENAI_EMBEDDING_DEPLOYMENT_NAME,
                     model=AZURE_OPENAI_EMBEDDING_MODEL,
@@ -579,7 +670,7 @@ with st.sidebar:
                 display_processing_times()
                 
         finally:
-            if pdf_source == "기본 문서 (YOUR_DEFAULT.pdf)" and uploaded_file:
+            if pdf_source == "기본 문서 (china_music.pdf)" and uploaded_file:
                 uploaded_file.close()
 
     # 저장된 벡터 저장소가 있을 때만 초기화 버튼 표시
@@ -655,7 +746,7 @@ if st.session_state.monitor_memory:
             st.metric("현재 메모리 사용량", f"{memory_info['process']} MB")
         time.sleep(30)
 
-# 메인 화면: 채팅 인터페이스
+# 메인 화면: 채팅 인터페이스 부분 수정
 if st.session_state.conversation is None:
     st.info("👈 시작하려면 PDF 파일을 업로드하세요.")
 else:
@@ -689,26 +780,33 @@ else:
                 st.write(response["answer"])
                 
                 if process_images:
+                    displayed_images_count = 0  # 표시된 이미지 수 추적
                     for doc in response.get("source_documents", []):
-                        if doc.metadata.get("images"):
+                        if doc.metadata.get("images") and displayed_images_count < 2:  # 최대 2개까지만 처리
                             st.info("이 답변과 관련된 이미지:")
                             for idx, image_base64 in enumerate(doc.metadata["images"]):
+                                if displayed_images_count >= 2:  # 2개 이상이면 중단
+                                    break
                                 try:
                                     image_bytes = base64.b64decode(image_base64)
                                     image = Image.open(io.BytesIO(image_bytes))
-                                    st.image(image, caption=f"관련 이미지 {idx + 1}", use_column_width=True)
+                                    st.image(image, caption=f"관련 이미지 {displayed_images_count + 1}", use_column_width=True)
                                     
                                     # 이미지 정보를 세션 상태에 저장
                                     st.session_state.displayed_images.append({
                                         "image": image_base64,
                                         "caption": "이 답변과 관련된 이미지:",
-                                        "index": f"관련 이미지 {idx + 1}"
+                                        "index": f"관련 이미지 {displayed_images_count + 1}"
                                     })
+                                    displayed_images_count += 1
                                 except Exception as e:
-                                    st.warning(f"이미지 표시 중 오류 발생: {str(e)}")
+                                    st.warning(f"이미지 표��� 중 오류 발생: {str(e)}")
+                                    
+                    if displayed_images_count == 2:  # 2개가 표시된 경우 메시지 표시
+                        st.info("(최대 2개의 관련 이미지만 표시됩니다)")
         
         # 채팅 기록 저장
-        st.session_state.chat_history.append((user_input, response["answer"])) 
+        st.session_state.chat_history.append((user_input, response["answer"]))
 
 def create_optimized_vector_store(documents, embeddings):
     """최적화된 벡터 저장소 생성"""
